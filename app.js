@@ -114,8 +114,14 @@ function resolveApiFromKey(input) {
   }
 
   if (/^sk-[\w-]+$/i.test(key)) {
+    /* 已经成功调用过(锁定 provider)则继承,避免在用户改文本时把已确认的家覆盖回默认 */
     const stored = SETTINGS.provider;
-    if (stored && PROVIDERS[stored] && stored !== 'custom') return packProvider(stored, key);
+    if (SETTINGS.providerLocked && stored && PROVIDERS[stored] && stored !== 'custom') {
+      return packProvider(stored, key);
+    }
+    /* 长度启发:DeepSeek 密钥目前都是 35 字符(sk- + 32 hex),
+     * OpenAI 用户级密钥 ≥ 51 字符。粘贴短 sk- 时默认归 DeepSeek,避免一上来就去打不通的 OpenAI。 */
+    if (key.length <= 40) return packProvider('deepseek', key);
     return packProvider('openai', key);
   }
 
@@ -136,13 +142,21 @@ function packProvider(provider, apiKey, baseUrl) {
 /** 写入 SETTINGS（保存前 / 对话前调用） */
 function applyApiKeyResolution(input) {
   const prev = SETTINGS.apiKey;
+  const prevProvider = SETTINGS.provider;
   const r = resolveApiFromKey(input != null ? input : SETTINGS.apiKey);
   if (!r.apiKey) return r;
+  const keyChanged = (input != null && r.apiKey !== prev) || prev !== r.apiKey;
+  const providerChanged = prevProvider !== r.provider;
   SETTINGS.apiKey = r.apiKey;
   SETTINGS.provider = r.provider;
   if (r.baseUrl) SETTINGS.baseUrl = r.baseUrl;
   else delete SETTINGS.baseUrl;
-  if (input != null || prev !== r.apiKey) SETTINGS.model = '';
+  /* provider 变了(例如从 openai 自动切到 deepseek)→ 必须清掉旧的 model,
+   * 否则会用 OpenAI 的模型名 gpt-xxx 去打 DeepSeek 端点,直接 400。 */
+  if (input != null || keyChanged || providerChanged) SETTINGS.model = '';
+  if (providerChanged) delete SETTINGS.baseUrl;
+  /* 密钥变了 → 清掉旧的 "已锁定 provider" 标记,下次调用重新走自动识别 */
+  if (keyChanged) delete SETTINGS.providerLocked;
   return r;
 }
 
@@ -158,16 +172,18 @@ function updateApiKeyHint(liveValue) {
   const r = resolveApiFromKey(key);
   const ambiguous = isAmbiguousSkKey(r.apiKey);
   if (ambiguous) {
-    /* 已经锁定过 provider(由用户成功调用过)就直接显示;否则提示"自动识别中" */
-    if (SETTINGS.provider === 'deepseek') {
-      el.textContent = `已识别 · DeepSeek · ${PROVIDERS.deepseek.defaultModel}`;
-      el.dataset.state = 'deepseek';
-    } else if (SETTINGS.provider === 'openai') {
-      el.textContent = `已识别 · OpenAI · ${PROVIDERS.openai.defaultModel}`;
-      el.dataset.state = 'openai';
+    const guess  = r.provider;
+    const guessCfg = PROVIDERS[guess] || PROVIDERS.openai;
+    const altId   = guess === 'deepseek' ? 'openai' : 'deepseek';
+    const altCfg  = PROVIDERS[altId];
+    /* 已经成功调用过一次,锁定了 provider — 显示"已识别" */
+    if (SETTINGS.providerLocked) {
+      el.textContent = `已识别 · ${guessCfg.label} · ${guessCfg.defaultModel}`;
+      el.dataset.state = guess;
     } else {
-      el.textContent = '自动识别 · OpenAI / DeepSeek · 首次对话时确认';
-      el.dataset.state = 'ambiguous';
+      /* 尚未实际调用 — 显示"按 X 尝试,失败自动切到 Y" */
+      el.textContent = `先按 ${guessCfg.label} 尝试 · 失败自动切到 ${altCfg.label}`;
+      el.dataset.state = guess;
     }
     return;
   }
@@ -1696,12 +1712,20 @@ async function callAi(messages, imageDataUrl) {
   };
 
   try {
-    return await callOnce(cfg);
+    const out = await callOnce(cfg);
+    /* 首次成功 → 把当前 provider 锁定,后续不再回退 */
+    if (!SETTINGS.providerLocked) {
+      SETTINGS.providerLocked = true;
+      saveSettings(SETTINGS);
+    }
+    return out;
   } catch (err) {
-    /* 仅在 sk- 模糊密钥 + 当前是 openai/deepseek + 错误像配对错时,切到另一家重试一次 */
+    /* 对 sk- 模糊密钥 + 未锁定 + 当前是 openai/deepseek → 无论什么错都试另一家,
+     * 因为在国内访问 OpenAI 常常返回的是网络层错误(Failed to fetch / CORS),
+     * 不会出现 401 这样的"认证错"关键词,所以不能只看错误内容判断。 */
     const altMap = { openai: 'deepseek', deepseek: 'openai' };
     const altId = altMap[provider];
-    if (!ambiguous || !altId || !looksLikeAuthOrShapeError(err)) throw err;
+    if (!ambiguous || !altId || SETTINGS.providerLocked) throw err;
 
     const altCfg = PROVIDERS[altId];
     if (!altCfg) throw err;
@@ -1717,6 +1741,8 @@ async function callAi(messages, imageDataUrl) {
 
     try {
       const out = await callOnce(altCfg);
+      SETTINGS.providerLocked = true;
+      saveSettings(SETTINGS);
       toast(`已自动识别为 ${altCfg.label}`);
       return out;
     } catch (err2) {
