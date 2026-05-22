@@ -365,7 +365,8 @@
           粘贴密钥即可，自动识别服务商与模型，无需手动选择。
         </p>
         <p class="settings-hint settings-hint-block">
-          <code>AIza…</code> → Gemini；<code>sk-…</code> → OpenAI（ChatGPT）。使用 DeepSeek 请填 <code>deepseek:你的密钥</code>。保存后直接上传照片即可开始对话。
+          <code>AIza…</code> → Gemini；<code>sk-…</code> → 自动识别 OpenAI 或 DeepSeek。<br />
+          保存后直接上传照片即可生成粒子云,发送消息时才会真正连接 AI。
         </p>
       </section>
 
@@ -417,36 +418,6 @@
 
         <p class="settings-hint settings-hint-block">
           粒子的清晰区、消散圈、大小与浮动幅度都在对话视图右下角的 TUNE 面板里实时调节。粒子的浮动只受时间驱动,与声音/音乐解耦,呈现一种温柔的呼吸感。
-        </p>
-      </section>
-
-      <!-- ============ 04 档案保管 · 本地文件 ============ -->
-      <section class="settings-group">
-        <header class="settings-group-h">
-          <span class="settings-group-num">04</span>
-          <span class="settings-group-label">档 案 · ARCHIVE</span>
-        </header>
-
-        <div class="vault-status" id="vault-status" data-state="unbound" data-supported="true">
-          <span class="vault-status-dot"></span>
-          <div class="vault-status-text">
-            <span class="vault-status-title" id="vault-status-title">未 绑 定 本 地 文 件</span>
-            <span class="vault-status-sub" id="vault-status-sub">档案当前仅保存在浏览器内</span>
-          </div>
-        </div>
-
-        <div class="vault-actions">
-          <button type="button" class="btn btn-ghost vault-btn" id="vault-bind">绑 定 本 地 文 件</button>
-          <button type="button" class="btn btn-ghost vault-btn" id="vault-pick" hidden>从 已 有 文 件 恢 复</button>
-          <button type="button" class="btn btn-ghost vault-btn" id="vault-unbind" hidden>解 除 绑 定</button>
-          <button type="button" class="btn btn-ghost vault-btn" id="vault-export">导 出 JSON</button>
-          <button type="button" class="btn btn-ghost vault-btn" id="vault-import">导 入 JSON</button>
-          <input type="file" id="vault-import-input" accept="application/json,.json" hidden />
-        </div>
-
-        <p class="settings-hint settings-hint-block" id="vault-hint">
-          绑定一个本地 <code>.json</code> 文件后,每次保存档案都会同步写入这个文件。即使浏览器缓存被清空、或你点击「清空档案」,文件中的内容也不会消失 — 下次打开网站会自动从文件恢复。<br />
-          <span class="vault-hint-fallback" hidden>当前浏览器不支持文件直连,可改用「导出 JSON」做手动备份、用「导入 JSON」恢复。</span>
         </p>
       </section>
 
@@ -584,6 +555,6 @@
 
 <!-- Three.js -->
 <script src="https://cdn.jsdelivr.net/npm/three@0.149.0/build/three.min.js"></script>
-<script src="app.js?v=vault1"></script>
+<script src="app.js?v=autodetect1"></script>
 </body>
 </html>

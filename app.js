@@ -151,15 +151,24 @@ function updateApiKeyHint(liveValue) {
   if (!el) return;
   const key = (liveValue != null ? liveValue : (SETTINGS.apiKey || '')).trim();
   if (!key) {
-    el.textContent = '支持 Gemini、ChatGPT(OpenAI)、DeepSeek；粘贴密钥即可。';
+    el.textContent = '支持 Gemini、ChatGPT(OpenAI)、DeepSeek;粘贴密钥即可,无需选择。';
     el.dataset.state = 'idle';
     return;
   }
   const r = resolveApiFromKey(key);
-  const ambiguous = /^sk-/i.test(r.apiKey) && !/^(openai|deepseek|gpt|chatgpt|gemini|google|ds)\s*[:：]/i.test(key);
-  if (ambiguous && !SETTINGS.provider) {
-    el.textContent = `将按 OpenAI 使用 · 若为 DeepSeek 请写 deepseek:密钥 · 模型 ${PROVIDERS.openai.defaultModel}`;
-    el.dataset.state = 'ambiguous';
+  const ambiguous = isAmbiguousSkKey(r.apiKey);
+  if (ambiguous) {
+    /* 已经锁定过 provider(由用户成功调用过)就直接显示;否则提示"自动识别中" */
+    if (SETTINGS.provider === 'deepseek') {
+      el.textContent = `已识别 · DeepSeek · ${PROVIDERS.deepseek.defaultModel}`;
+      el.dataset.state = 'deepseek';
+    } else if (SETTINGS.provider === 'openai') {
+      el.textContent = `已识别 · OpenAI · ${PROVIDERS.openai.defaultModel}`;
+      el.dataset.state = 'openai';
+    } else {
+      el.textContent = '自动识别 · OpenAI / DeepSeek · 首次对话时确认';
+      el.dataset.state = 'ambiguous';
+    }
     return;
   }
   el.textContent = `将使用 · ${r.label} · ${PROVIDERS[r.provider].defaultModel}${r.baseUrl ? ' · 兼容接口' : ''}`;
@@ -448,207 +457,20 @@ async function loadArchiveFromDb() {
   return Array.isArray(list) ? list : null;
 }
 
-/* =====================================================
-   FILE VAULT — 长期本地文件保管
-   ----------------------------------------------------
-   把档案同步写到用户自选的本地 JSON 文件,即使浏览器缓存被清空、
-   "清空档案"按钮被点击,文件本身依旧保留,下次进入网站可重新从文件
-   回填。优先使用 File System Access API(Chrome/Edge),不支持的浏
-   览器降级到"导出/导入 JSON"。
-   ===================================================== */
-const VAULT_HANDLE_KEY = 'hortus.archive.fileHandle.v1';
-const FileVault = (function () {
-  let cachedHandle = null;
-  let cachedHandleLoaded = false;
-  let writeLock = Promise.resolve(true);
-  const listeners = new Set();
-
-  function supported() {
-    return typeof window !== 'undefined'
-      && typeof window.showSaveFilePicker === 'function'
-      && typeof window.showOpenFilePicker === 'function';
-  }
-
-  function notify() {
-    const info = { bound: !!cachedHandle, name: cachedHandle ? (cachedHandle.name || '') : '', supported: supported() };
-    listeners.forEach(fn => { try { fn(info); } catch {} });
-  }
-  function subscribe(fn) { listeners.add(fn); fn({ bound: !!cachedHandle, name: cachedHandle ? (cachedHandle.name || '') : '', supported: supported() }); return () => listeners.delete(fn); }
-
-  async function ensureHandleLoaded() {
-    if (cachedHandleLoaded) return cachedHandle;
-    cachedHandleLoaded = true;
-    try {
-      const h = await archiveDbGet(VAULT_HANDLE_KEY);
-      if (h && typeof h === 'object') cachedHandle = h;
-    } catch (err) {
-      console.warn('FileVault: handle load failed', err);
-    }
-    return cachedHandle;
-  }
-
-  async function persistHandle(h) {
-    cachedHandle = h || null;
-    cachedHandleLoaded = true;
-    try { await archiveDbPut(VAULT_HANDLE_KEY, h || null); }
-    catch (err) { console.warn('FileVault: persist handle failed', err); }
-    notify();
-  }
-
-  async function ensurePermission(h, mode, opts) {
-    if (!h || typeof h.queryPermission !== 'function') return true;
-    const silent = opts && opts.silent;
-    try {
-      let p = await h.queryPermission({ mode });
-      if (p === 'granted') return true;
-      /* 启动时(silent=true)不主动弹权限框 — 没有用户手势会被浏览器拒绝 */
-      if (silent) return false;
-      p = await h.requestPermission({ mode });
-      return p === 'granted';
-    } catch (err) {
-      console.warn('FileVault: permission failed', err);
-      return false;
-    }
-  }
-
-  async function bind() {
-    if (!supported()) throw new Error('当前浏览器不支持本地文件持久化');
-    const handle = await window.showSaveFilePicker({
-      suggestedName: 'sylvan-diary-archive.json',
-      types: [{ description: 'Sylvan Diary Archive (JSON)', accept: { 'application/json': ['.json'] } }],
-    });
-    await persistHandle(handle);
-    return handle;
-  }
-
-  async function pickExisting() {
-    if (!supported()) throw new Error('当前浏览器不支持本地文件持久化');
-    const picked = await window.showOpenFilePicker({
-      types: [{ description: 'Sylvan Diary Archive (JSON)', accept: { 'application/json': ['.json'] } }],
-      multiple: false,
-    });
-    const handle = picked && picked[0];
-    if (!handle) throw new Error('未选择文件');
-    await persistHandle(handle);
-    return handle;
-  }
-
-  async function unbind() {
-    cachedHandle = null;
-    cachedHandleLoaded = true;
-    try { await archiveDbPut(VAULT_HANDLE_KEY, null); } catch {}
-    notify();
-  }
-
-  async function readFromFile(opts) {
-    const h = await ensureHandleLoaded();
-    if (!h) return null;
-    const ok = await ensurePermission(h, 'read', opts);
-    if (!ok) return null;
-    try {
-      const file = await h.getFile();
-      const text = (await file.text()).trim();
-      if (!text) return [];
-      const data = JSON.parse(text);
-      if (Array.isArray(data)) return data;
-      if (data && Array.isArray(data.archive)) return data.archive;
-      return null;
-    } catch (err) {
-      console.warn('FileVault: read failed', err);
-      return null;
-    }
-  }
-
-  async function writeToFile(list, opts) {
-    const h = await ensureHandleLoaded();
-    if (!h) return false;
-    const next = writeLock.then(async () => {
-      const ok = await ensurePermission(h, 'readwrite', opts);
-      if (!ok) return false;
-      try {
-        const payload = JSON.stringify({
-          schema: 'sylvan.diary.archive.v1',
-          updatedAt: new Date().toISOString(),
-          count: Array.isArray(list) ? list.length : 0,
-          archive: Array.isArray(list) ? list : [],
-        }, null, 2);
-        const writable = await h.createWritable();
-        await writable.write(payload);
-        await writable.close();
-        return true;
-      } catch (err) {
-        console.warn('FileVault: write failed', err);
-        return false;
-      }
-    });
-    writeLock = next.catch(() => false);
-    return next;
-  }
-
-  function getBoundName() { return cachedHandle ? (cachedHandle.name || '本地档案文件') : ''; }
-  function isBound() { return !!cachedHandle; }
-
-  return { supported, subscribe, ensureHandleLoaded, bind, pickExisting, unbind, readFromFile, writeToFile, getBoundName, isBound };
-})();
-
-/* 把档案序列化成 JSON 字符串,供"导出"按钮 / FileVault 共用 */
-function serializeArchive(list) {
-  return JSON.stringify({
-    schema: 'sylvan.diary.archive.v1',
-    updatedAt: new Date().toISOString(),
-    count: Array.isArray(list) ? list.length : 0,
-    archive: Array.isArray(list) ? list : [],
-  }, null, 2);
-}
-
-/* 从任意 JSON 文本中尽量解析出档案数组 */
-function parseArchivePayload(text) {
-  if (!text || !text.trim()) return [];
-  const data = JSON.parse(text);
-  if (Array.isArray(data)) return data;
-  if (data && Array.isArray(data.archive)) return data.archive;
-  throw new Error('文件格式不正确：缺少 archive 数组');
-}
-
 async function saveArchive(list) {
-  let primaryErr = null;
   try {
     await archiveDbPut(CONFIG.storageKey, list);
     try { localStorage.removeItem(CONFIG.storageKey); } catch {}
   } catch (dbErr) {
-    primaryErr = dbErr;
     try { localStorage.setItem(CONFIG.storageKey, JSON.stringify(list)); }
-    catch (lsErr) { /* 没存住浏览器侧,但仍尝试写文件 */ }
+    catch (lsErr) { throw dbErr; }
   }
-  /* 同步写入本地文件(若绑定);失败不影响主流程 */
-  if (FileVault.isBound()) {
-    FileVault.writeToFile(list).catch(err => console.warn('FileVault sync failed', err));
-  }
-  if (primaryErr && !FileVault.isBound()) throw primaryErr;
 }
 
 let ARCHIVE = loadArchiveLegacy();
 
 async function hydrateArchive() {
   try {
-    /* 1) 优先尝试本地文件(若已绑定且已授权 — 启动阶段不主动弹权限框) */
-    await FileVault.ensureHandleLoaded();
-    if (FileVault.isBound()) {
-      try {
-        const fromFile = await FileVault.readFromFile({ silent: true });
-        if (Array.isArray(fromFile)) {
-          ARCHIVE = fromFile;
-          /* 回写到 IndexedDB 作为缓存(失败也不阻塞) */
-          try { await archiveDbPut(CONFIG.storageKey, ARCHIVE); } catch {}
-          tickTime();
-          if (views.archive && views.archive.classList.contains('is-active')) renderArchive();
-          return;
-        }
-      } catch (err) {
-        console.warn('FileVault hydrate failed, falling back to IndexedDB', err);
-      }
-    }
-    /* 2) 退回 IndexedDB */
     const indexedArchive = await loadArchiveFromDb();
     if (Array.isArray(indexedArchive)) ARCHIVE = indexedArchive;
     else if (ARCHIVE.length > 0) await saveArchive(ARCHIVE);
@@ -1844,13 +1666,68 @@ function dataUrlParts(dataUrl) {
   return { mime, data: b64 };
 }
 
+/* OpenAI 和 DeepSeek 的密钥都以 sk- 开头,无法纯靠正则分辨。
+ * 策略:先按当前推断的 provider 尝试;若失败且错误像"认证/路径/模型不存在"
+ * 这类配对错误,自动切到另一家重试一次。成功后把 provider 锁进 SETTINGS。
+ * 这样用户始终只需要"粘贴密钥",不必加 deepseek: 前缀。 */
+function isAmbiguousSkKey(key) {
+  if (!key) return false;
+  if (!/^sk-[\w-]+$/i.test(key)) return false;
+  if (/^sk-proj-/i.test(key)) return false;   // OpenAI 项目级,专属
+  if (/^sk-or-v1-/i.test(key)) return false;  // OpenRouter,专属
+  return true;
+}
+function looksLikeAuthOrShapeError(err) {
+  const msg = String((err && err.message) || err || '').toLowerCase();
+  return /401|403|400|404|unauthor|forbidden|invalid|api[_\s-]*key|authentication|model.*(not\s*found|does\s*not\s*exist)|incorrect|wrong|deprecated/.test(msg);
+}
+
 async function callAi(messages, imageDataUrl) {
   const key = activeApiKey();
   if (!key) throw new Error('缺少 API 密钥 — 请到设置里粘贴密钥');
   applyApiKeyResolution(key);
-  const cfg = activeProviderCfg();
-  if (cfg.schema === 'gemini') return callGeminiSchema(messages, imageDataUrl, key, cfg);
-  return callOpenAiSchema(messages, imageDataUrl, key, cfg);
+  let cfg = activeProviderCfg();
+  const provider = activeProvider();
+  const ambiguous = isAmbiguousSkKey(key);
+
+  const callOnce = async (c) => {
+    if (c.schema === 'gemini') return callGeminiSchema(messages, imageDataUrl, key, c);
+    return callOpenAiSchema(messages, imageDataUrl, key, c);
+  };
+
+  try {
+    return await callOnce(cfg);
+  } catch (err) {
+    /* 仅在 sk- 模糊密钥 + 当前是 openai/deepseek + 错误像配对错时,切到另一家重试一次 */
+    const altMap = { openai: 'deepseek', deepseek: 'openai' };
+    const altId = altMap[provider];
+    if (!ambiguous || !altId || !looksLikeAuthOrShapeError(err)) throw err;
+
+    const altCfg = PROVIDERS[altId];
+    if (!altCfg) throw err;
+    console.warn(`callAi: ${provider} failed, retrying with ${altId}`, err && err.message);
+
+    /* 切换 provider:清掉旧 model / baseUrl,改用新 provider 的默认值 */
+    const prevModel = SETTINGS.model;
+    const prevBaseUrl = SETTINGS.baseUrl;
+    SETTINGS.provider = altId;
+    SETTINGS.model = '';
+    delete SETTINGS.baseUrl;
+    saveSettings(SETTINGS);
+
+    try {
+      const out = await callOnce(altCfg);
+      toast(`已自动识别为 ${altCfg.label}`);
+      return out;
+    } catch (err2) {
+      /* 两边都失败 — 回滚到原 provider/model/baseUrl,把更明确的错误抛出去 */
+      SETTINGS.provider = provider;
+      SETTINGS.model = prevModel || '';
+      if (prevBaseUrl) SETTINGS.baseUrl = prevBaseUrl;
+      saveSettings(SETTINGS);
+      throw err2;
+    }
+  }
 }
 
 async function callGeminiSchema(messages, imageDataUrl, key, cfg) {
@@ -2468,11 +2345,8 @@ async function generateTheme(session) {
   ].join('\n');
 
   try {
-    const cfg = activeProviderCfg();
     const messages = [{ role: 'user', text: prompt }];
-    let raw;
-    if (cfg.schema === 'gemini') raw = await callGeminiSchema(messages, null, activeApiKey(), cfg);
-    else raw = await callOpenAiSchema(messages, null, activeApiKey(), cfg);
+    const raw = await callAi(messages, null);
     /* 容错解析 JSON */
     const m = raw.match(/\{[\s\S]*?"theme"[\s\S]*?\}/);
     if (m) {
@@ -3125,166 +2999,14 @@ $('#settings-save').addEventListener('click', () => {
   });
 })();
 
-/* =====================================================
-   档案保管 UI — 绑定 / 解绑 / 导出 / 导入
-   ===================================================== */
-(function setupVaultUI() {
-  const statusEl   = $('#vault-status');
-  const titleEl    = $('#vault-status-title');
-  const subEl      = $('#vault-status-sub');
-  const btnBind    = $('#vault-bind');
-  const btnPick    = $('#vault-pick');
-  const btnUnbind  = $('#vault-unbind');
-  const btnExport  = $('#vault-export');
-  const btnImport  = $('#vault-import');
-  const fileInput  = $('#vault-import-input');
-  const fallbackEl = $('.vault-hint-fallback');
-  if (!statusEl) return;
-
-  const supported = FileVault.supported();
-  /* 不支持 FSA 的浏览器:把绑定按钮藏起来,仅留导出/导入 */
-  if (!supported) {
-    btnBind.hidden = true;
-    btnPick.hidden = true;
-    btnUnbind.hidden = true;
-    if (fallbackEl) fallbackEl.hidden = false;
-    if (statusEl) statusEl.dataset.supported = 'false';
-  }
-
-  function paintStatus(info) {
-    const bound = !!info.bound;
-    statusEl.dataset.state = bound ? 'bound' : 'unbound';
-    if (bound) {
-      titleEl.textContent = info.name || '本地档案文件 · 已绑定';
-      subEl.textContent   = '档案会同步写入本地文件 · 删除浏览器缓存也不会丢失';
-      btnBind.hidden   = true;
-      btnPick.hidden   = true;
-      btnUnbind.hidden = false;
-    } else {
-      titleEl.textContent = supported ? '未 绑 定 本 地 文 件' : '当前浏览器不支持本地文件直连';
-      subEl.textContent   = supported ? '档案当前仅保存在浏览器内' : '请使用「导出 / 导入」做手动备份';
-      btnBind.hidden   = !supported;
-      btnPick.hidden   = !supported;
-      btnUnbind.hidden = true;
-    }
-  }
-
-  FileVault.subscribe(paintStatus);
-  /* 启动时也先尝试读取(handle 来自 IndexedDB),保证状态正确 */
-  FileVault.ensureHandleLoaded().then(() => paintStatus({ bound: FileVault.isBound(), name: FileVault.getBoundName(), supported }));
-
-  /* —— 绑定新文件:创建一个空 JSON,并把当前档案写进去 —— */
-  if (btnBind) btnBind.addEventListener('click', async () => {
-    try {
-      await FileVault.bind();
-      const ok = await FileVault.writeToFile(ARCHIVE);
-      if (ok) toast('已绑定本地文件 · 档案已写入');
-      else    toast('已绑定文件,但写入失败 — 请检查权限');
-    } catch (err) {
-      if (err && err.name === 'AbortError') return;
-      console.warn(err);
-      toast('绑定失败:' + (err.message || err));
-    }
-  });
-
-  /* —— 从已有文件恢复:把文件中的档案读回浏览器 —— */
-  if (btnPick) btnPick.addEventListener('click', async () => {
-    try {
-      await FileVault.pickExisting();
-      const data = await FileVault.readFromFile();
-      if (Array.isArray(data)) {
-        ARCHIVE = data;
-        try { await archiveDbPut(CONFIG.storageKey, ARCHIVE); } catch {}
-        renderArchive();
-        tickTime();
-        toast(`已从文件恢复 ${ARCHIVE.length} 条档案`);
-      } else {
-        toast('文件已绑定,但内容为空或格式不符');
-      }
-    } catch (err) {
-      if (err && err.name === 'AbortError') return;
-      console.warn(err);
-      toast('恢复失败:' + (err.message || err));
-    }
-  });
-
-  /* —— 解除绑定:仅断开连接,文件本身保留 —— */
-  if (btnUnbind) btnUnbind.addEventListener('click', async () => {
-    if (!confirm('解除绑定后,新的档案变更将不再自动写入文件。\n文件本身会保留在原位置。\n\n继续解绑?')) return;
-    await FileVault.unbind();
-    toast('已解除本地文件绑定');
-  });
-
-  /* —— 导出:任何浏览器都能用的备份方案 —— */
-  if (btnExport) btnExport.addEventListener('click', () => {
-    try {
-      const payload = serializeArchive(ARCHIVE);
-      const blob = new Blob([payload], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      a.href = url;
-      a.download = `sylvan-diary-archive-${stamp}.json`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      toast(`已导出 ${ARCHIVE.length} 条档案`);
-    } catch (err) {
-      console.warn(err);
-      toast('导出失败:' + (err.message || err));
-    }
-  });
-
-  /* —— 导入:可选择「合并」或「替换」 —— */
-  if (btnImport) btnImport.addEventListener('click', () => fileInput && fileInput.click());
-  if (fileInput) fileInput.addEventListener('change', async (e) => {
-    const f = e.target.files && e.target.files[0];
-    fileInput.value = '';
-    if (!f) return;
-    try {
-      const text = await f.text();
-      const incoming = parseArchivePayload(text);
-      if (!Array.isArray(incoming)) throw new Error('JSON 中找不到档案数组');
-      const merge = ARCHIVE.length > 0
-        ? confirm(`检测到现有档案 ${ARCHIVE.length} 条,导入档案 ${incoming.length} 条。\n\n确定 = 合并(按 id 去重)\n取消 = 替换为导入档案`)
-        : false;
-      if (merge) {
-        const map = new Map();
-        for (const e of ARCHIVE) if (e && e.id) map.set(e.id, e);
-        for (const e of incoming) if (e && e.id) map.set(e.id, e);
-        ARCHIVE = Array.from(map.values()).sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
-      } else {
-        ARCHIVE = incoming;
-      }
-      await saveArchive(ARCHIVE);
-      renderArchive();
-      tickTime();
-      toast(merge ? `已合并 · 共 ${ARCHIVE.length} 条` : `已导入 · 共 ${ARCHIVE.length} 条`);
-    } catch (err) {
-      console.warn(err);
-      toast('导入失败:' + (err.message || err));
-    }
-  });
-})();
-
-/* 仅清空浏览器内副本(IndexedDB + localStorage),不动 FileVault 绑定的本地文件 */
-async function clearBrowserArchiveOnly() {
-  ARCHIVE = [];
-  try { await archiveDbPut(CONFIG.storageKey, []); } catch {}
-  try { localStorage.removeItem(CONFIG.storageKey); } catch {}
-}
-
 $('#clear-archive').addEventListener('click', async () => {
-  const bound = FileVault.isBound();
-  const msg = bound
-    ? `已绑定本地档案文件「${FileVault.getBoundName()}」。\n清空仅会移除浏览器内的副本,本地文件中的档案仍保留 — 刷新或重新打开页面后会自动从文件恢复。\n\n继续清空浏览器内的副本吗?`
-    : '确定清空所有档案吗?这无法撤销。\n\n提示:可以先在设置中「导出档案」或「绑定本地文件」做长期备份。';
-  if (!confirm(msg)) return;
-  await clearBrowserArchiveOnly();
-  renderArchive();
-  tickTime();
-  toast(bound ? '浏览器内副本已清空 · 本地文件保留' : '档案已清空');
+  if (confirm('确定清空所有档案吗？这无法撤销。')) {
+    ARCHIVE = [];
+    await saveArchive(ARCHIVE);
+    renderArchive();
+    tickTime();
+    toast('档案已清空');
+  }
 });
 
 /* ============ 启动 ============ */
